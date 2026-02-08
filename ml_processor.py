@@ -2,15 +2,17 @@ import cv2
 import sqlite3
 import datetime
 import time
+import threading
+import yt_dlp
+from flask import Flask, jsonify, render_template
 from ultralytics import YOLO
 
-# Initialize YOLOv8
-model = YOLO('yolov8n.pt') 
+app = Flask(__name__)
 
+# --- DATABASE LOGIC ---
 def init_db():
-    conn = sqlite3.connect('benguet_crowd.db')
+    conn = sqlite3.connect('benguet_crowd.db', check_same_thread=False)
     c = conn.cursor()
-    # Stores the total cumulative count
     c.execute('''CREATE TABLE IF NOT EXISTS realtime_crowd 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, 
                   road_name TEXT, 
@@ -19,71 +21,101 @@ def init_db():
     conn.commit()
     conn.close()
 
-def log_data(road, total_count):
-    conn = sqlite3.connect('benguet_crowd.db')
+def log_data(road, count):
+    conn = sqlite3.connect('benguet_crowd.db', check_same_thread=False)
     c = conn.cursor()
     c.execute("INSERT INTO realtime_crowd (road_name, total_count, timestamp) VALUES (?, ?, ?)",
-              (road, total_count, datetime.datetime.now()))
+              (road, count, datetime.datetime.now()))
     conn.commit()
     conn.close()
 
-def process_uploaded_video(video_path, road_name):
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print(f"Error: Cannot open {video_path}")
+def get_latest_data():
+    conn = sqlite3.connect('benguet_crowd.db', check_same_thread=False)
+    c = conn.cursor()
+    c.execute("""SELECT road_name, total_count FROM realtime_crowd 
+                 WHERE id IN (SELECT MAX(id) FROM realtime_crowd GROUP BY road_name)""")
+    rows = c.fetchall()
+    conn.close()
+    return {row[0]: row[1] for row in rows}
+
+# --- FLASK ROUTES ---
+@app.route('/api/crowd')
+def crowd_api():
+    return jsonify(get_latest_data())
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+# --- YOLO VISION LOGIC ---
+def get_live_stream_url(webpage_url):
+    ydl_opts = {'format': 'best', 'quiet': True}
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(webpage_url, download=False)
+        return info['url']
+
+def process_live_camera(url, road_name):
+    print(f"Connecting to stream: {road_name}...")
+    try:
+        stream_url = get_live_stream_url(url)
+    except Exception as e:
+        print(f"Error getting stream: {e}")
         return
 
-    line_y = 400 
-    counted_ids = set() # Global set to ensure unique counting
+    cap = cv2.VideoCapture(stream_url)
+    model = YOLO('yolov8n.pt')
+    
+    # --- COUNTING CONFIG ---
+    line_y = 400 # Horizontal line position
+    counted_ids = set() # Stores IDs that already crossed this minute
     start_time = time.time()
 
     while cap.isOpened():
         ret, frame = cap.read()
-        if not ret: 
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # Loop video
-            continue
+        if not ret: break
 
         frame = cv2.resize(frame, (1024, 576))
-
+        
         # Track people (class 0)
-        results = model.track(frame, persist=True, classes=[0], verbose=False)
+        results = model.track(frame, persist=True, classes=[0], verbose=False, tracker="botsort.yaml")
 
-        if results[0].boxes.id is not None:
+        if results[0].boxes is not None and results[0].boxes.id is not None:
             boxes = results[0].boxes.xyxy.cpu().numpy()
             ids = results[0].boxes.id.int().cpu().numpy()
 
             for box, obj_id in zip(boxes, ids):
-                # 1. Coordinate Logic
                 x1, y1, x2, y2 = box
-                center_y = (y1 + y2) / 2
+                center_y = (y1 + y2) / 2 # Calculate center of person
                 
-                # 2. "Head Area" Bounding Box Calculation
-                # We take the top 25% of the person's detected box to simulate head detection
-                head_height = (y2 - y1) * 0.25
-                hx1, hy1, hx2, hy2 = int(x1), int(y1), int(x2), int(y1 + head_height)
-
-                # 3. Visual: Draw Head Square & ID Number
-                cv2.rectangle(frame, (hx1, hy1), (hx2, hy2), (0, 255, 255), 2)
-                cv2.putText(frame, f"P-{obj_id}", (hx1, hy1 - 10), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-
-                # 4. Counting Logic (Crosses the line)
+                # --- LINE CROSSING LOGIC ---
+                # If person crosses the line and hasn't been counted yet
                 if center_y > line_y and obj_id not in counted_ids:
                     counted_ids.add(obj_id)
+                
+                # Visuals: Box and ID
+                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y1 + 25)), (0, 255, 255), -1)
+                cv2.putText(frame, f"ID:{obj_id}", (int(x1), int(y1)+18), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 2)
 
-        # --- OVERLAY ---
-        cv2.rectangle(frame, (0, 0), (1024, 50), (0, 0, 0), -1)
-        cv2.putText(frame, f"LT-CCTV: {road_name} | TOTAL PASSERBY: {len(counted_ids)}", (20, 35), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        
-        # Detection Line
-        cv2.line(frame, (0, line_y), (1024, line_y), (0, 0, 255), 2)
+        # --- DRAW DETECTION LINE ---
+        cv2.line(frame, (0, line_y), (1024, line_y), (0, 0, 255), 3)
+        cv2.putText(frame, "DETECTION LINE", (10, line_y - 10), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
-        cv2.imshow("La Trinidad Security Monitor - Cumulative", frame)
+        # UI Overlay
+        cv2.rectangle(frame, (0,0), (450, 70), (0,0,0), -1)
+        cv2.putText(frame, f"FEED: {road_name}", (20, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"PASSED THIS MIN: {len(counted_ids)}", (20, 55), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-        # UPDATE DB EVERY 10 SECONDS (No Reset)
-        if time.time() - start_time >= 5:
+        cv2.imshow("Security Feed - Trigger Counter", frame)
+
+        # LOG DATA EVERY 60 SECONDS
+        if time.time() - start_time >= 60:
+            print(f"MINUTE LOG: {len(counted_ids)} people crossed the line.")
             log_data(road_name, len(counted_ids))
+            counted_ids.clear() # Reset for the new minute
             start_time = time.time()
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -92,7 +124,15 @@ def process_uploaded_video(video_path, road_name):
     cap.release()
     cv2.destroyAllWindows()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     init_db()
-    # Make sure your file is named 'la_trinidad_feed.mp4'
-    process_uploaded_video('la_trinidad_feed.mp4', "Halsema Hwy (Km. 5)")
+    
+    # Soliman St (Agdao) YouTube Stream
+    cam_url = "https://youtu.be/kCvjW21S_Dw" 
+    cam_name = "Soliman St (Agdao)"
+
+    vision_thread = threading.Thread(target=process_live_camera, args=(cam_url, cam_name))
+    vision_thread.daemon = True
+    vision_thread.start()
+
+    app.run(debug=False, port=5000, use_reloader=False)
