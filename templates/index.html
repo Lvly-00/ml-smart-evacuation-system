@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Cumulative Crowd Monitor</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        #map { height: 90vh; width: 100%; }
+        body { font-family: 'Courier New', monospace; background: #000; color: #0f0; margin: 0; }
+        .ui { padding: 10px; background: #111; border-bottom: 1px solid #0f0; }
+    </style>
+</head>
+<body>
+
+    <div class="ui">
+        <b>COMMAND CENTER: LA TRINIDAD</b> | STATUS: <span id="status">SYNCING...</span>
+    </div>
+    <div id="map"></div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        const map = L.map('map').setView([16.4526, 120.5925], 16);
+
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png').addTo(map);
+
+        const roads = [
+            { name: "Halsema Hwy (Km. 5)", coords: [[16.4515, 120.5921], [16.4565, 120.5935]], layer: null }
+        ];
+
+        function getEvacuationColor(total) {
+            if (total > 30) return "#ff0000"; // Severe
+            if (total > 20) return "#ffa500"; // Moderate
+            return "#00ff00";                 // Low
+        }
+
+        async function refreshMap() {
+            try {
+                const response = await fetch('/api/crowd');
+                const data = await response.json();
+                
+                document.getElementById('status').innerText = "LIVE (5s Refresh) - Last Sync: " + new Date().toLocaleTimeString();
+
+                roads.forEach(road => {
+                    const total = data[road.name] || 0;
+                    const color = getEvacuationColor(total);
+
+                    if (road.layer) map.removeLayer(road.layer);
+
+                    road.layer = L.polyline(road.coords, {
+                        color: color,
+                        weight: 12,
+                        opacity: 0.8
+                    }).addTo(map).bindPopup(`<b>${road.name}</b><br>Total Evacuees Detected: ${total}`);
+                });
+            } catch (err) { console.log("Waiting for ML data..."); }
+        }
+
+        // UPDATED: Now refreshes every 5000ms (5 seconds)
+        setInterval(refreshMap, 5000);
+        refreshMap();
+    </script>
+</body>
+</html>
